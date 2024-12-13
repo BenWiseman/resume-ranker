@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+networkx
+scipy
+nltk
+torch
+sentence-transformers
+openai
+plotly
+requests
