@@ -1,15 +1,14 @@
+import hashlib
+import json
 import networkx as nx
 from nltk.corpus import stopwords
 import nltk
 import numpy as np
-import os
 import re
 import requests
 from scipy.optimize import linear_sum_assignment
 from sentence_transformers import SentenceTransformer, util
 import streamlit as st
-import time
-import torch
 
 
 nltk.download('stopwords', quiet=True)
@@ -39,61 +38,60 @@ def word_analysis(job_desc_sections, resumes_data):
     return results
 
 def transformers_embedding_analysis(job_desc_sections, resume_sections, model_name='all-mpnet-base-v2'):
-    from sentence_transformers import SentenceTransformer, util
-    import numpy as np
-
     model = SentenceTransformer(model_name)
     job_desc_embeddings = model.encode(job_desc_sections, convert_to_numpy=True)
     resume_embeddings = model.encode(resume_sections, convert_to_numpy=True)
 
-    # Compute cosine distances using util.cos_sim on numpy arrays:
-    # util.cos_sim can take torch tensors, but we want numpy. Let's do manual cosine on numpy.
-    # Alternatively, we can convert embeddings to torch tensors. Let's do manual numpy-based similarity:
-    # util.cos_sim expects torch, so let's write a numpy-based cosine similarity function:
-    norm_job = job_desc_embeddings / np.linalg.norm(job_desc_embeddings, axis=1, keepdims=True)
-    norm_resume = resume_embeddings / np.linalg.norm(resume_embeddings, axis=1, keepdims=True)
-    similarity_matrix = np.dot(norm_job, norm_resume.T)  # shape [num_desc, num_resume]
+    return cosine_similarity(job_desc_embeddings, resume_embeddings)
 
-    return similarity_matrix
+def embed_text_openai_individual(texts, model_name, api_key):
+    if not texts:
+        return np.array([])
 
-def oai_embedding_analysis(job_desc_sections, resume_sections, model_name, api_key):
-    import requests
-    import numpy as np
-    from scipy.spatial.distance import cdist
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
 
-    def embed_text_openai(texts, model_name, api_key):
-        import json
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+    embeddings = []
+    for idx, t in enumerate(texts):
         data = {
             "model": model_name,
-            "input": texts
+            "input": [t]
         }
+
         response = requests.post("https://api.openai.com/v1/embeddings", headers=headers, json=data)
+        
         if response.status_code != 200:
-            st.error(f"OpenAI API error: {response.status_code}, {response.text}")
+            st.error(f"OpenAI API error on text {idx}: {response.status_code}, {response.text}")
             return np.array([])
+
         json_resp = response.json()
-        embeddings = [item['embedding'] for item in json_resp['data']]
-        time.sleep(5)
-        return np.array(embeddings)
+        if 'data' not in json_resp or len(json_resp['data']) != 1:
+            st.error(f"Unexpected response for text {idx}: {json_resp}")
+            return np.array([])
+        
+        emb = json_resp['data'][0]['embedding']
+        embeddings.append(emb)
 
-    job_desc_embeddings = embed_text_openai(job_desc_sections, model_name, api_key)
-    if job_desc_embeddings.size == 0:
-        return np.array([[]])
+        # Add a short delay to reduce chance of rate limiting issues
+        #time.sleep(.01)
 
-    resume_embeddings = embed_text_openai(resume_sections, model_name, api_key)
-    if resume_embeddings.size == 0:
-        return np.array([[]])
+    return np.array(embeddings)
 
-    # Compute cosine similarity matrix
-    norm_job = job_desc_embeddings / np.linalg.norm(job_desc_embeddings, axis=1, keepdims=True)
-    norm_resume = resume_embeddings / np.linalg.norm(resume_embeddings, axis=1, keepdims=True)
-    similarity_matrix = np.dot(norm_job, norm_resume.T)  # shape [num_desc, num_resume]
+def oai_embedding_analysis(job_desc_sections, resume_sections, model_name, api_key):
+    job_desc_embeddings = embed_text_openai_individual(job_desc_sections, model_name, api_key)
+    resume_embeddings = embed_text_openai_individual(resume_sections, model_name, api_key)
 
-    return similarity_matrix
+    return cosine_similarity(job_desc_embeddings, resume_embeddings)
+
+def cosine_similarity(job_desc_embedding: np.ndarray, resume_embeddings:np.ndarray):
+    norm_job = job_desc_embedding / np.linalg.norm(job_desc_embedding, axis=1, keepdims=True)
+    norm_resumes = resume_embeddings / np.linalg.norm(resume_embeddings, axis=1, keepdims=True)
+    similarity_matrix = np.dot(norm_job, norm_resumes.T)
+
+    return(similarity_matrix)
+
 
 def max_per_section_average(similarity_matrix: np.ndarray) -> float:
     """
@@ -199,6 +197,24 @@ def min_cost_max_flow(similarity_matrix: np.ndarray, C=3) -> float:
     score = np.mean(assigned_similarities) * 100
     return round(score, 2)
 
+# ties in min_cost_max_flow could break things, so adding an insignificant amount of jitter 
+# not enough to meaningfully change results
+def stable_tie_break(similarity_matrix):
+    M, N = similarity_matrix.shape
+    perturbed = similarity_matrix.copy()
+
+    for i in range(M):
+        for j in range(N):
+            key = f"{i}_{j}"
+            # Use a stable hash (like md5)
+            h = hashlib.md5(key.encode('utf-8')).hexdigest()
+            # Convert hex to int
+            h_int = int(h, 16)
+            # Create a tiny offset
+            offset = (h_int % 1000000) / 1e15
+            perturbed[i, j] += offset
+
+    return perturbed
 # Mapping of models to provider and function
 model_provider_map = {
     "all-mpnet-base-v2": {"provider": "transformers", "function": transformers_embedding_analysis},
